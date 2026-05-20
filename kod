@@ -1,0 +1,269 @@
+import os
+import time
+import csv
+import argparse
+from collections import defaultdict
+
+
+def read_graph(path):
+    with open(path, 'r', encoding='utf-8') as f:
+        first = f.readline().split()
+        n, m = int(first[0]), int(first[1])
+        edges = []
+        adj = [set() for _ in range(n)]
+
+        for line in f:
+            if not line.strip():
+                continue
+
+            a, b = map(int, line.split()[:2])
+
+            if a == b:
+                continue
+
+            if b not in adj[a]:
+                adj[a].add(b)
+                adj[b].add(a)
+                edges.append((a, b))
+
+    return n, edges, adj
+
+
+def greedy_coloring(adj):
+    n = len(adj)
+    order = sorted(range(n), key=lambda v: len(adj[v]), reverse=True)
+
+    color = [-1] * n
+
+    for v in order:
+        used = {color[u] for u in adj[v] if color[u] != -1}
+
+        c = 0
+        while c in used:
+            c += 1
+
+        color[v] = c
+
+    return max(color) + 1, color
+
+
+def var_id(v, c, k):
+    return v * k + c + 1
+
+
+def make_cnf(n, edges, k):
+    clauses = []
+
+    for v in range(n):
+        clauses.append([var_id(v, c, k) for c in range(k)])
+
+    for v in range(n):
+        for c1 in range(k):
+            for c2 in range(c1 + 1, k):
+                clauses.append([-var_id(v, c1, k), -var_id(v, c2, k)])
+
+    for a, b in edges:
+        for c in range(k):
+            clauses.append([-var_id(a, c, k), -var_id(b, c, k)])
+
+    return clauses, n * k
+
+
+def simplify(clauses, lit):
+    new_clauses = []
+    neg = -lit
+
+    for clause in clauses:
+        if lit in clause:
+            continue
+
+        if neg in clause:
+            new_clause = [x for x in clause if x != neg]
+
+            if not new_clause:
+                return None
+
+            new_clauses.append(new_clause)
+        else:
+            new_clauses.append(clause)
+
+    return new_clauses
+
+
+def unit_propagate(clauses, assign):
+    changed = True
+
+    while changed:
+        changed = False
+
+        for clause in clauses:
+            if len(clause) == 1:
+                lit = clause[0]
+                v = abs(lit)
+                val = 1 if lit > 0 else -1
+
+                if assign.get(v, 0) == -val:
+                    return None, None
+
+                if assign.get(v, 0) == val:
+                    continue
+
+                assign[v] = val
+                clauses = simplify(clauses, lit)
+
+                if clauses is None:
+                    return None, None
+
+                changed = True
+                break
+
+    return clauses, assign
+
+
+def choose_var(clauses, assign):
+    cnt = defaultdict(int)
+
+    for clause in clauses:
+        for lit in clause:
+            v = abs(lit)
+
+            if v not in assign:
+                cnt[v] += 1
+
+    if not cnt:
+        return None
+
+    return max(cnt, key=cnt.get)
+
+
+def dpll(clauses, assign, start_time, timeout):
+    if time.time() - start_time > timeout:
+        raise TimeoutError
+
+    clauses, assign = unit_propagate(clauses, assign)
+
+    if clauses is None:
+        return None
+
+    if not clauses:
+        return assign
+
+    v = choose_var(clauses, assign)
+
+    if v is None:
+        return assign
+
+    for lit in (v, -v):
+        new_assign = dict(assign)
+        new_assign[v] = 1 if lit > 0 else -1
+
+        new_clauses = simplify(clauses, lit)
+
+        if new_clauses is None:
+            continue
+
+        res = dpll(new_clauses, new_assign, start_time, timeout)
+
+        if res is not None:
+            return res
+
+    return None
+
+
+def sat_coloring(n, edges, k, timeout=10):
+    clauses, vars_count = make_cnf(n, edges, k)
+    start = time.time()
+
+    try:
+        model = dpll(clauses, {}, start, timeout)
+    except TimeoutError:
+        return 'timeout', None, vars_count, len(clauses), time.time() - start
+
+    if model is None:
+        return 'unsat', None, vars_count, len(clauses), time.time() - start
+
+    colors = [-1] * n
+
+    for v in range(n):
+        for c in range(k):
+            if model.get(var_id(v, c, k), 0) == 1:
+                colors[v] = c
+                break
+
+    return 'sat', colors, vars_count, len(clauses), time.time() - start
+
+
+def check_coloring(edges, colors):
+    if colors is None or any(c < 0 for c in colors):
+        return False
+
+    for a, b in edges:
+        if colors[a] == colors[b]:
+            return False
+
+    return True
+
+
+def solve_file(path, timeout):
+    n, edges, adj = read_graph(path)
+    greedy_k, greedy_colors = greedy_coloring(adj)
+
+    rows = []
+    best_colors = greedy_colors
+    best_k = greedy_k
+
+    for k in range(greedy_k, 0, -1):
+        status, colors, var_cnt, clause_cnt, sec = sat_coloring(n, edges, k, timeout)
+
+        ok = check_coloring(edges, colors) if status == 'sat' else False
+
+        rows.append({
+            'file': os.path.basename(path),
+            'n': n,
+            'm': len(edges),
+            'k': k,
+            'vars': var_cnt,
+            'clauses': clause_cnt,
+            'status': status,
+            'time_sec': round(sec, 4),
+            'correct': ok
+        })
+
+        if status == 'sat' and ok:
+            best_k = k
+            best_colors = colors
+            continue
+
+        if status in ('unsat', 'timeout'):
+            break
+
+    return rows, best_k, best_colors
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('paths', nargs='+')
+    parser.add_argument('--timeout', type=float, default=10)
+    parser.add_argument('--csv', default='results.csv')
+
+    args = parser.parse_args()
+
+    all_rows = []
+
+    for path in args.paths:
+        rows, best_k, colors = solve_file(path, args.timeout)
+        all_rows.extend(rows)
+
+        print(f'{os.path.basename(path)}: best found k = {best_k}')
+
+    if all_rows:
+        with open(args.csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=list(all_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(all_rows)
+
+        print(f'table saved to {args.csv}')
+
+
+if __name__ == '__main__':
+    main()
